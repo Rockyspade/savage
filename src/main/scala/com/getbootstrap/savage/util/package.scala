@@ -6,6 +6,7 @@ import java.io.{IOException, InputStream}
 import java.util.Scanner
 import akka.event.LoggingAdapter
 import scala.util.Try
+import com.typesafe.config.Config
 
 package object util {
   val utf8Name = "UTF-8"
@@ -17,6 +18,17 @@ package object util {
 
   implicit class Utf8ByteArray(bytes: Array[Byte]) {
     def utf8String: Try[String] = Try { new String(bytes, utf8) }
+  }
+
+  implicit class PrefixedString(str: String) {
+    def unprefix(prefix: String): Option[String] = {
+      if (str.startsWith(prefix)) {
+        Some(str.stripPrefix(prefix))
+      }
+      else {
+        None
+      }
+    }
   }
 
   private object UnixFileSystemString {
@@ -63,8 +75,18 @@ package object util {
         java.nio.file.Files.walkFileTree(path, new DeleterFileVisitor(log))
       }
       catch {
+        case nsfe:java.nio.file.NoSuchFileException => {
+          // file/directory is already nonexistent
+        }
         case exc:IOException => log.error(exc, s"Error while deleting ${path}")
       }
     }
+  }
+
+  implicit class RichConfig(config: Config) {
+    import java.util.concurrent.TimeUnit
+    import scala.concurrent.duration.FiniteDuration
+
+    def getFiniteDuration(path: String): FiniteDuration = FiniteDuration(config.getDuration(path, TimeUnit.SECONDS), TimeUnit.SECONDS)
   }
 }

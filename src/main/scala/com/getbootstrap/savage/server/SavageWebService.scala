@@ -1,21 +1,23 @@
 package com.getbootstrap.savage.server
 
-import scala.util.{Try,Success,Failure}
 import akka.actor.ActorRef
 import spray.routing._
 import spray.http._
 import com.getbootstrap.savage.PullRequestBuildResult
-import com.getbootstrap.savage.github.{BranchDeletionRequest, PullRequestNumber}
+import com.getbootstrap.savage.github.{SavageBranch, commit_status, pr_action, event => events}
+import com.getbootstrap.savage.github.commit_status.StatusForCommit
+import com.getbootstrap.savage.github.util._
 
 class SavageWebService(
   protected val pullRequestEventHandler: ActorRef,
   protected val pullRequestCommenter: ActorRef,
-  protected val branchDeleter: ActorRef
+  protected val branchDeleter: ActorRef,
+  protected val statusSetter: ActorRef
 ) extends ActorWithLogging with HttpService {
-  import GitHubWebHooksDirectives.{authenticatedPullRequestEvent,authenticatedIssueOrCommentEvent}
+  import GitHubWebHooksDirectives.{gitHubEvent,authenticatedPullRequestEvent,authenticatedIssueOrCommentEvent}
   import TravisWebHookDirectives.authenticatedTravisEvent
 
-  private val settings = Settings(context.system)
+  private implicit val settings = Settings(context.system)
   override def actorRefFactory = context
   override def receive = runRoute(theOnlyRoute)
 
@@ -29,24 +31,24 @@ class SavageWebService(
       path("github") {
         pathEndOrSingleSlash {
           post {
-            headerValueByName("X-Github-Event") { githubEvent =>
-              githubEvent match {
-                case "ping" => {
+            gitHubEvent(log) { ghEvent =>
+              ghEvent match {
+                case events.Ping => {
                   log.info("Successfully received GitHub webhook ping.")
                   complete(StatusCodes.OK)
                 }
-                case "issue_comment" => {
+                case events.IssueComment => {
                   authenticatedIssueOrCommentEvent(settings.GitHubWebHookSecretKey.toArray) { event => {
                     pullRequestEventHandler ! event
                     complete(StatusCodes.OK)
                   }}
                 }
-                case "pull_request" => {
+                case events.PullRequest => {
                   authenticatedPullRequestEvent(settings.GitHubWebHookSecretKey.toArray) { event =>
-                    event.getAction match {
-                      case "opened" | "synchronize" => {
+                    event.action match {
+                      case pr_action.Opened | pr_action.Synchronize => {
                         val pr = event.getPullRequest
-                        if (pr.getState == "open") {
+                        if (pr.isOpen) {
                           pullRequestEventHandler ! pr
                           complete(StatusCodes.OK)
                         }
@@ -68,19 +70,24 @@ class SavageWebService(
         pathEndOrSingleSlash {
           post {
             authenticatedTravisEvent(travisToken = settings.TravisToken, repo = settings.TestRepoId, log = log) { event =>
-              if (event.branchName.name.startsWith(settings.BranchPrefix)) {
-                Try { Integer.parseInt(event.branchName.name.stripPrefix(settings.BranchPrefix)) }.flatMap{ intStr => Try{ PullRequestNumber(intStr).get } } match {
-                  case Failure(exc) => log.error(exc, s"Invalid Savage branch name from Travis event: ${event.branchName}")
-                  case Success(prNum) => {
-                    branchDeleter ! BranchDeletionRequest(event.branchName, event.commitSha)
-                    pullRequestCommenter ! PullRequestBuildResult(
-                      prNum = prNum,
-                      commitSha = event.commitSha,
-                      buildUrl = event.buildUrl,
-                      succeeded = event.status.isSuccessful
-                    )
+              SavageBranch(event.branchName) match {
+                case Some(branch@SavageBranch(prNum, _)) => {
+                  branchDeleter ! branch
+                  log.info(s"Told ${branchDeleter} to delete ${branch}")
+                  val commitStatus = if (event.status.isSuccessful) {
+                    commit_status.Success("CONFIRMED: Savage cross-browser JS tests passed", event.buildUrl)
+                  } else {
+                    commit_status.Failure("BUSTED: Savage cross-browser JS tests failed", event.buildUrl)
                   }
+                  statusSetter ! StatusForCommit(event.commitSha, commitStatus)
+                  pullRequestCommenter ! PullRequestBuildResult(
+                    prNum = prNum,
+                    commitSha = event.commitSha,
+                    buildUrl = event.buildUrl,
+                    succeeded = event.status.isSuccessful
+                  )
                 }
+                case None => log.info(s"Ignoring authentic Travis event from irrelevant or invalid ${event.branchName}")
               }
               complete(StatusCodes.OK)
             }
